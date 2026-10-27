@@ -335,7 +335,7 @@ const displayDistance = (distance / 1000) *
     (unit_mode === 1 ? 0.621371 : 1);
 
 treadmillData = {
-speed: (displaySpeed * 0.6).toFixed(2) + " " + speed_unit,
+speed: (displaySpeed * 0.972).toFixed(2) + " " + speed_unit,
     distance: displayDistance.toFixed(2) + " " + distance_unit,
         calories: calories + " kcal",
         steps: steps,
