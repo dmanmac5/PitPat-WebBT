@@ -325,8 +325,8 @@ function handleNotification(event) {
     else if (running_state_bits === 16) running_state = 2;
     else running_state = 3;
     const statusArr = ["Starting", "Running", "Paused", "Stopped"];
-    const speed_unit = unit_mode === 1 ? "mph" : "kph";
-const distance_unit = unit_mode === 1 ? "mi" : "km";
+const speed_unit = "kph";
+const distance_unit = "km";
 
 // Convert metric readings to imperial when needed.
 const displaySpeed = (current_speed / 1000) *
@@ -335,7 +335,7 @@ const displayDistance = (distance / 1000) *
     (unit_mode === 1 ? 0.621371 : 1);
 
 treadmillData = {
-speed: (displaySpeed * 0.972).toFixed(2) + " " + speed_unit,
+speed: displaySpeed.toFixed(2) + " " + speed_unit,
     distance: displayDistance.toFixed(2) + " " + distance_unit,
         calories: calories + " kcal",
         steps: steps,
