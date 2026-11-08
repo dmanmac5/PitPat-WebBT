@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PitPat Overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<!--
+  Stream overlay for the PitPat dashboard. Open it from the dashboard buttons.
+  URL options:
+    ?layout=bar     steps + hobbit walking a 7-mile progress bar (resets each goal)
+    ?layout=border  hobbit walks the whole screen border, 2.5 mi per side
+    ?layout=steps   small step counter card on its own
+    ?bg=green | magenta   solid colour for OBS chroma key (default transparent)
+    ?goal=7         miles per goal (default 7)
+    ?side=2.5       miles per side of the screen in the border layout (default 2.5)
+    ?demo=1         fake walking data, for previewing without the pad
+    &start=6.9      demo: miles into this stream   &journey=130  demo: journey miles so far
+  Checkpoints and gear are set in journey.js.
+-->
+<style>
+  :root {
+    --panel: #181222;
+    --panel-edge: #9b6dd6;     /* purple, matches the game frame */
+    --cyan: #4fc3f7;           /* matches the camera frame */
+    --orange: #ff8a3d;         /* progress colour */
+    --gold: #ffd166;
+    --text: #ffffff;
+    --label: #b9aecb;
+    --track: #2e2440;
+    --pixel: "Press Start 2P", ui-monospace, monospace;
+    --body: system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  body.bg-green { background: #00ff00; }
+  body.bg-magenta { background: #ff00ff; }
+  body { font-family: var(--body); color: var(--text); }
+  .offline { opacity: 0.4; filter: grayscale(0.6); transition: opacity .4s; }
+  .label { font-family: var(--pixel); font-size: 10px; letter-spacing: .08em; color: var(--label); text-transform: uppercase; }
+  .num { font-weight: 800; font-variant-numeric: tabular-nums; }
+  canvas.sprite { image-rendering: pixelated; display: block; }
+
+  /* ---------- BAR layout ---------- */
+  #bar { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 10px; }
+  .layout-bar #bar { display: flex; }
+  .bar-card {
+    width: 100%; height: 100%; max-height: 190px; max-width: 1000px;
+    display: grid; grid-template-columns: 200px 1fr; gap: 22px; align-items: stretch;
+    background: var(--panel); border: 2px solid var(--panel-edge); border-radius: 12px;
+    padding: 14px 22px;
+  }
+  .bar-steps { display: flex; flex-direction: column; justify-content: center; gap: 8px; border-right: 1px solid #3a2f4d; padding-right: 18px; }
+  .bar-steps .num { font-size: 40px; line-height: 1; }
+  .bar-steps .sub { font-size: 12px; color: var(--label); }
+  .bar-journey { display: flex; flex-direction: column; justify-content: center; gap: 6px; min-width: 0; }
+  .bar-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .bar-head .num { font-size: 26px; }
+  .bar-head .sub { font-size: 12px; color: var(--label); }
+  .bar-head .lap { font-family: var(--pixel); font-size: 10px; color: var(--gold); text-align: right; line-height: 1.5; }
+  .lane { position: relative; height: 80px; }
+  .lane .track { position: absolute; left: 0; right: 68px; bottom: 18px; height: 10px; background: var(--track); border-radius: 2px; }
+  .lane .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--orange); border-radius: 2px; transition: width 1s linear; }
+  .lane .tick { position: absolute; top: 67px; transform: translateX(-50%); font-family: var(--pixel); font-size: 7px; color: var(--label); }
+  .lane .walker { position: absolute; bottom: 27px; left: 0; transform: translateX(-50%); transition: left 1s linear; }
+  .lane .goal { position: absolute; right: 0; bottom: 18px; width: 62px; display: flex; justify-content: center; }
+
+  /* ---------- BORDER layout ---------- */
+  #border { position: absolute; inset: 0; display: none; }
+  .layout-border #border { display: block; }
+  #border svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #border .walker { position: absolute; left: 0; top: 0; will-change: transform; z-index: 2; }
+  .tag {
+    position: absolute; font-family: var(--pixel); font-size: 10px; line-height: 1.6; white-space: nowrap; z-index: 3;
+    background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 4px; padding: 4px 6px;
+  }
+  .corner { position: absolute; font-family: var(--pixel); font-size: 9px; color: var(--label);
+    background: var(--panel); border-radius: 3px; padding: 3px 5px; transform: translate(-50%, -50%); white-space: nowrap; }
+  .corner.done { color: var(--orange); }
+  .corner.goalmark { color: var(--gold); border: 1px solid var(--gold); }
+
+  /* ---------- STEPS card ---------- */
+  #stepsCard { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; padding: 8px; }
+  .layout-steps #stepsCard { display: flex; }
+  /* step counter beside the border walker (layout=border&steps=bl|br|tl|tr) */
+  #comboSteps { position: absolute; display: none; z-index: 3; }
+  #comboSteps.show { display: flex; }
+  #comboSteps.bl { left: 60px; bottom: 60px; } #comboSteps.br { right: 60px; bottom: 60px; }
+  #comboSteps.tl { left: 60px; top: 60px; }    #comboSteps.tr { right: 60px; top: 60px; }
+  #comboSteps.bc { left: 50%; bottom: 70px; transform: translateX(-50%); }
+  /* narrow / vertical windows: stack the bar card */
+  @media (max-width: 720px) {
+    .bar-card { grid-template-columns: 1fr; max-height: none; height: auto; gap: 10px; padding: 16px 18px; }
+    .bar-steps { border-right: 0; padding-right: 0; border-bottom: 1px solid #3a2f4d; padding-bottom: 12px; }
+    .bar-head { flex-direction: column; align-items: flex-start; gap: 6px; }
+    .bar-head .lap { text-align: left; }
+  }
+  body.vertical #bar { align-items: flex-end; padding: 16px 16px 120px; }
+  .steps-card { display: flex; align-items: center; gap: 14px; background: var(--panel); border: 2px solid var(--cyan);
+    border-radius: 12px; padding: 12px 20px; }
+  .steps-card .num { font-size: 38px; line-height: 1; }
+  .steps-card .sub { font-size: 12px; color: var(--label); margin-top: 6px; }
+
+  /* ---------- goal celebration ---------- */
+  .jump { animation: jump .45s ease-out 5; }
+  @keyframes jump { 0%,100% { translate: 0 0; } 40% { translate: 0 -26px; } }
+  .banner {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0);
+    font-family: var(--pixel); font-size: 22px; color: var(--gold); text-shadow: 3px 3px 0 #000;
+    background: var(--panel); border: 3px solid var(--gold); border-radius: 8px; padding: 14px 20px;
+    white-space: nowrap; pointer-events: none; z-index: 5;
+  }
+  .layout-bar .banner, .layout-steps .banner { font-size: 16px; }
+  .banner.show { animation: pop 3.2s ease-out forwards; }
+  @keyframes pop { 0% { transform: translate(-50%,-50%) scale(0); } 12% { transform: translate(-50%,-50%) scale(1.1); }
+    20%,85% { transform: translate(-50%,-50%) scale(1); opacity: 1; } 100% { transform: translate(-50%,-50%) scale(1); opacity: 0; } }
+  .confetti { position: absolute; width: 8px; height: 8px; pointer-events: none; z-index: 4; animation: fall 1.6s ease-in forwards; }
+  @keyframes fall { to { transform: translate(var(--dx), var(--dy)); opacity: 0; } }
+</style>
+</head>
+<body>
+  <!-- BAR -->
+  <div id="bar" class="offline">
+    <div class="bar-card">
+      <div class="bar-steps">
+        <div class="label">Steps</div>
+        <div class="num" id="barSteps">0</div>
+        <div class="sub" id="barSpeed">0.0 mph</div>
+      </div>
+      <div class="bar-journey">
+        <div class="bar-head">
+          <div><span class="label">This stream&nbsp;</span> <span class="num" id="barMiles">0.00</span> <span class="sub">mi</span></div>
+          <div class="lap" id="barLap">GOAL · 7 MI</div>
+        </div>
+        <div class="lane" id="lane">
+          <div class="track"><div class="fill" id="barFill"></div></div>
+          <div class="walker" id="barWalker"></div>
+          <div class="goal" id="barGoal"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BORDER -->
+  <div id="border" class="offline">
+    <svg id="borderSvg"></svg>
+    <div id="corners"></div>
+    <div class="walker" id="borderWalker"><div id="borderJump"></div></div>
+    <div class="tag" id="borderTag">0.00 mi</div>
+    <div id="comboSteps" class="steps-card">
+      <div>
+        <div class="label">Steps</div>
+        <div class="num" id="comboStepsNum">0</div>
+        <div class="sub" id="comboStepsSub">0.00 mi this stream</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STEPS -->
+  <div id="stepsCard" class="offline">
+    <div class="steps-card">
+      <div id="stepsSprite"></div>
+      <div>
+        <div class="label">Steps</div>
+        <div class="num" id="cardSteps">0</div>
+        <div class="sub" id="cardSub">0.00 mi this stream</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="banner" id="banner">GOAL!</div>
+
+<script src="journey.js"></script>
+<script>
+const Q = new URLSearchParams(location.search);
+const LAYOUT = ['bar', 'border', 'steps'].includes(Q.get('layout')) ? Q.get('layout') : 'bar';
+const GOAL_MI = parseFloat(Q.get('goal')) > 0 ? parseFloat(Q.get('goal')) : 7;
+const SIDE_MI = parseFloat(Q.get('side')) > 0 ? parseFloat(Q.get('side')) : 2.5;
+const LOOP_MI = SIDE_MI * 4;
+document.body.classList.add('layout-' + LAYOUT);
+if (Q.get('vertical')) document.body.classList.add('vertical');
+if (Q.get('bg') === 'green' || Q.get('bg') === 'magenta') document.body.classList.add('bg-' + Q.get('bg'));
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString();
+
+/* ---------------- Pixel hobbit sprite ----------------
+   Original chibi pixel character (Donni), side view facing right. Edit the colours here
+   to match Donni (hair, clothes). Avoid bright green: chroma key removes it. */
+// Colours: H/h/d hair (dark brown), S/s skin, p blush, W/w waistcoat, C shirt,
+// B breeches, F feet, P backpack, R belt, K outline. Gear: G/g cloak, T stick,
+// M/m sword & silver shirt, Y gold. Avoid bright green: the chroma key removes it.
+const PAL = {
+  K: '#1b1320', H: '#3b2414', h: '#5c3a20', d: '#26160b',
+  S: '#f1c27d', s: '#d9a066', p: '#e88a8a', E: '#1b1320',
+  W: '#9e2f26', w: '#6e1f19', C: '#efe3c2', c: '#cbbf9e',
+  B: '#6b4a2b', F: '#e0a96e', P: '#8b5e34', R: '#3b2a1c',
+  G: '#24543a', g: '#183a28', T: '#a07a4a', M: '#c3c9d3', m: '#8e95a1', Y: '#f2c230',
+};
+const HEAD = [
+  '....KK.KKK.KK.....',
+  '...KhHKHhHKHhKK...',
+  '..KHhHHHHHHHHhHK..',
+  '.KHHHHHhHHHHHHHHK.',
+  '.KHHdHHHHHHHhHHHK.',
+  'KHHdHHHHHHHHHHHHHK',
+  'KHHdHHHHHHSHHHHHK.',
+  'KHdHKHHHSSSSHHSSK.',
+  '.KHKSSKSSSSSddSSK.',
+  '.KHKSsKSSSSSSESSSK',
+  '.KHKKSSSSSSSSESSSSK',
+  '..KHKKSSSSSSpSSSK.',
+  '...KHHKSSSSSSSSKK.',
+  '....KKKKKSSSSKK...',
+].map(r => r.padEnd(19, '.').slice(0, 18));
+const TORSO = [
+  '.....KWWCCCWK.....',
+  '...KPKWWCCCWWK....',
+  '..KPPKWwCCCWWSK...',
+  '..KPPKWwCCCWKSK...',
+  '..KPPKRRRRRRKK....',
+  '...KKKBBBBBBBK....',
+];
+const TORSO_UP = [ // arms in the air
+  '.....KWWCCCWK.KSK.',
+  '...KPKWWCCCWWKSK..',
+  '..KPPKWwCCCWWK....',
+  '..KPPKWwCCCWK.....',
+  '..KPPKRRRRRRK.....',
+  '...KKKBBBBBBBK....',
+];
+const LEGS = {
+  a: ['.....KBBK.KBBK....', '.....KBBK.KBBK....', '....KFFFK.KFFFFK..', '....KKKKK.KKKKKK..'],
+  b: ['....KBBK...KBBK...', '...KBBK.....KBBK..', '..KFFFK.....KFFFFK', '..KKKKK.....KKKKKK'],
+  c: ['.....KBBBBBBBK....', '.....KBBK.KBBK....', '....KFFFK.KFFFFK..', '....KKKKK.KKKKKK..'],
+};
+const GEAR_ART = {
+  ring:    { paint: [[8, 15, 'Y'], [9, 15, 'Y'], [8, 16, 'Y']] },
+  cloak:   { paint: [[4, 13, 'G'], [3, 14, 'G'], [2, 15, 'G'], [3, 15, 'G'],
+                     ...[16, 17, 18].flatMap(y => [[2, y, 'G'], [3, y, 'g'], [4, y, 'G']]),
+                     [1, 16, 'K'], [1, 17, 'K'], [1, 18, 'K'], [1, 19, 'K'], [2, 19, 'G'], [3, 19, 'G'], [1, 20, 'K'], [2, 20, 'G'], [2, 21, 'K']] },
+  stick:   { paint: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23].map(y => [15, y, 'T']) },
+  sword:   { paint: [[5, 18, 'R'], [4, 19, 'M'], [3, 20, 'M'], [2, 21, 'M'], [1, 22, 'm']] },
+  lantern: { paint: [[14, 17, 'R'], [14, 18, 'Y'], [14, 19, 'Y'], [14, 20, 'R']] },
+  mail:    { recolor: { W: 'M', w: 'm' } },
+};
+function applyGear(rows, gear) {
+  let g = rows.map(r => [...r]);
+  gear.forEach(name => { const art = GEAR_ART[name]; if (art && art.recolor)
+    g = g.map(r => r.map(ch => art.recolor[ch] || ch)); });
+  gear.forEach(name => { const art = GEAR_ART[name]; if (art && art.paint)
+    art.paint.forEach(([x, y, ch]) => { if (g[y]) g[y][x] = ch; }); });
+  return g.map(r => r.join(''));
+}
+function drawPixels(rows, pal, scale) {
+  const c = document.createElement('canvas');
+  c.className = 'sprite';
+  c.width = rows[0].length; c.height = rows.length;
+  c.style.width = c.width * scale + 'px'; c.style.height = c.height * scale + 'px';
+  const g = c.getContext('2d');
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (pal[ch]) { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); } }));
+  return c;
+}
+function makeHobbit(host, scale) {
+  let frames, gearKey = null;
+  function build(gear) {
+    const f = rows => drawPixels(applyGear(rows, gear), PAL, scale);
+    frames = {
+      a: f([...HEAD, ...TORSO, ...LEGS.a]),
+      b: f([...HEAD, ...TORSO, ...LEGS.b]),
+      c: f([...HEAD, ...TORSO, ...LEGS.c]),
+      up: f([...HEAD, ...TORSO_UP, ...LEGS.c]),
+    };
+  }
+  build([]);
+  const wrap = document.createElement('div');
+  host.appendChild(wrap);
+  let cur = null, step = 0;
+  const api = {
+    walking: false, celebrating: false, flip: false,
+    width: 18 * scale, height: 24 * scale,
+    show(name) { if (cur !== name) { wrap.replaceChildren(frames[name]); cur = name; } },
+    setGear(gear) { const k = gear.join(','); if (k !== gearKey) { gearKey = k; build(gear); const c = cur; cur = null; api.show(c || 'c'); } },
+    tick() {
+      if (api.celebrating) api.show('up');
+      else if (api.walking) api.show(step++ % 2 ? 'a' : 'b');
+      else api.show('c');
+      wrap.style.transform = api.flip ? 'scaleX(-1)' : '';
+    },
+  };
+  api.tick();
+  return api;
+}
+// Little pixel volcano for the end of the bar (generic, not film art)
+const VOLCANO = ['.....OO.....', '....O..O....', '.....KK.....', '....KLLK....',
+                 '...KKLKKK...', '..KKKKLKKK..', '.KKKKKKKLKK.', 'KKKKKKKKKKKK'];
+const VPAL = { O: '#ff8a3d', L: '#ff5a1f', K: '#3b3245' };
+
+/* Built-in checkpoint icons: original, generic landmarks. Any checkpoint in
+   journey.js can use one of these or point at its own image instead. */
+const IPAL = { r: '#8a3b2b', w: '#d9c9a3', d: '#5a3a22', y: '#ffd166', g: '#4f7f3a', s: '#8c8496', S: '#b8b0c4',
+  t: '#6b4a2b', l: '#e0a030', L: '#c27a20', b: '#4fa3d6', B: '#2f6f9e', n: '#f2f2f2', m: '#6c6480',
+  c: '#1a1422', p: '#5d6b3a', x: '#b09a4a', f: '#d64545', K: '#3b3245', O: '#ff8a3d' };
+// Cottage: thatched dome roof, round-top wooden door, flower bed out front.
+const COTTAGE_PAL = { K: '#2a1d18', c: '#8a5a3a', h: '#e0b06e', t: '#c08a4a', T: '#8f6230', w: '#ecd9b0',
+  W: '#c9ad80', y: '#ffd166', d: '#8a5530', D: '#6a3f22', k: '#ffd166', g: '#4f7f3a', G: '#3e6a2e',
+  r: '#e05a5a', n: '#f5ead0', p: '#f29bb8', s: '#b8b0a4' };
+const ICON_PALS = { cottage: COTTAGE_PAL };
+const ICONS = {
+  cottage: [
+            '............KccK....', '.......KKKKKKccK....', '.....KKhhhhhhKKK....', '....KhhhhhhhhtttK...',
+            '...KhhhhhhtttttttK..', '...KhhhhThhhttTttK..', '..KhhhhhtttTttttTTK.', '..KhtttttttttttTTTK.',
+            '.KhhTtttTttttTtttTTK', '.KTTTTTTTTTTTTTTTTTK', '..KKKKKKKKKKKKKKKKK.', '..KWwwwwKKKKwwwwWK..',
+            'r.KWyywKddddKwyyWK.r', 'GrKWyyKdddDddKyyWKrG', '.GKWwwKdddDkdKwwWKG.', 'rGnWwwKdddDddKwwWnGp',
+            'GnrGwwKdddDddKwwGrnG', 'GpGnrGKdddDddKGrnGpG', 'ggggggsssssssggggggg'],
+  inn:      ['......rrrr......', '....rrrrrrrr....', '..rrrrrrrrrrrr..', '...wwwwwwwwww...', 'tttwyywwwwyyw...',
+            't..wyywwwwyyw...', 'dd.wwwwddwwww...', 'dd.wwwwddwwww...', 't..wwwwddwwww...', 'gggggggggggggggg'],
+  tower:    ['......s.s.s.....', '......sssss.....', '......sSsss.....', '......ssyss.....', '......sssSs.....',
+            '......sssss.....', '.....sssssss....', '...ggggggggggg..', '.gggggggggggggg.', 'gggggggggggggggg'],
+  waterfall:['..mm........mm..', '.mmmm..bb..mmmm.', 'mmmmm..bb.mmmmmm', 'mmrrr..bb..rrrmm', 'mmwyw..bB..wywmm',
+            'mmwww..bb..wwwmm', 'gggggbbbbbbggggg', 'gggbbBbbbBbbbggg'],
+  mountain: ['.......nn.......', '......nnnn......', '.....nnmmnn.....', '....nmmmmmmn....', '...mmmmmmmmmm...',
+            '..mmmsmmmmmsmm..', '.mmmmmmmmmmmmmm.', 'mmmmmmmmmmmmmmmm'],
+  cave:     ['...ssssssssss...', '..ssSssssssSss..', '.ssssscccccssss.', '.sssscccccccsss.', '.ssscccccccccss.',
+            '.ssscccccccccss.', '.ssscccccccccss.', 'ssssccccccccccss'],
+  forest:   ['..ll......ll....', '.lLll....lllL...', 'lllLll..lLllll..', '.llll..lllLlll..', '..t....lllll....',
+            '..t......t......', '..t......t......', 'gggggggggggggggg'],
+  stones:   ['..ss........ss..', '.sSss......sSss.', '.ssss......ssss.', '.ssss......ssss.', '.ssss......ssss.',
+            '.ssss.bbbb.ssss.', 'bbbbbbbBbbbbbbbb', 'bBbbbbbbbbbBbbbb'],
+  marsh:    ['................', '..x.....x....x..', '..x..x..x.x..x..', '.xx..x.xx.x.xx..', 'ppppbbpppppbbppp',
+            'pbbbbppbbbbppbbp'],
+  castle:   ['.f..............', '.ff.......s.s...', '.s........sss...', 's.s.s.s...sss...', 'sssssssssssss...',
+            'ssSssssssSsss...', 'sssssysssssssy..', 'ssssscccssssss..', 'gggggggggggggggg'],
+};
+function iconFor(cp) {
+  if (!cp) return drawPixels(VOLCANO, VPAL, 4);           // journey complete
+  if (ICONS[cp.icon]) return drawPixels(ICONS[cp.icon], ICON_PALS[cp.icon] || IPAL, 3);
+  if (cp.icon === 'volcano') return drawPixels(VOLCANO, VPAL, 4);
+  if (cp.icon) { const img = new Image(); img.src = cp.icon; img.className = 'sprite';
+    img.style.cssText = 'width:48px;height:48px;object-fit:contain;image-rendering:pixelated'; return img; }
+  return drawPixels(ICONS.cottage, IPAL, 3);
+}
+
+/* ---------------- Journey (from journey.js) ---------------- */
+const CPS = (typeof JOURNEY !== 'undefined' && JOURNEY.checkpoints || []).slice().sort((a, b) => a.mile - b.mile);
+const GEAR = (typeof JOURNEY !== 'undefined' && JOURNEY.gear) || [];
+const nextCheckpoint = j => CPS.find(c => c.mile > j + 1e-6) || null;
+const reachedCount = j => CPS.filter(c => c.mile <= j + 1e-6).length;
+const gearAt = j => GEAR.filter(g => g.mile <= j + 1e-6).map(g => g.item);
+const esc = t => String(t).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+function nextText(j) {
+  const cp = nextCheckpoint(j);
+  return cp ? `Next checkpoint · ${(cp.mile - j).toFixed(1)} mi` : 'JOURNEY COMPLETE!';
+}
+
+/* ---------------- Stream totals ----------------
+   The pad resets its distance when it's stopped and started again, so the overlay
+   keeps a running total for the whole stream. "Reset stream totals" on the
+   dashboard clears it; it also clears itself after 6 hours with no data. */
+const STORE = 'pitpat_stream_totals';
+let T = { offMi: 0, offSteps: 0, lastMi: 0, lastSteps: 0, ts: 0 };
+try { const s = JSON.parse(localStorage.getItem(STORE)); if (s && Date.now() - s.ts < 6 * 3600e3) T = s; } catch {}
+function save() { try { localStorage.setItem(STORE, JSON.stringify(T)); } catch {} }
+let goalsSeen = Math.floor((T.offMi + T.lastMi) / GOAL_MI); // don't re-celebrate on reload
+function resetTotals() { T = { offMi: 0, offSteps: 0, lastMi: 0, lastSteps: 0, ts: Date.now() }; save(); goalsSeen = 0; }
+function ingest(d) {
+  if (d.distanceMi < T.lastMi - 0.02) { T.offMi += T.lastMi; T.offSteps += T.lastSteps; } // pad restarted
+  T.lastMi = d.distanceMi; T.lastSteps = d.steps; T.ts = Date.now(); save();
+  return { miles: T.offMi + d.distanceMi, steps: T.offSteps + d.steps };
+}
+
+/* ---------------- Celebration ---------------- */
+let celebrateUntil = 0;
+const celebrating = () => Date.now() < celebrateUntil;
+function celebrate(text) {
+  celebrateUntil = Date.now() + 2400;
+  hobbit.celebrating = true; hobbit.tick();
+  const b = $('banner');
+  b.textContent = text;
+  b.classList.remove('show'); void b.offsetWidth; b.classList.add('show');
+  jumpEl.classList.remove('jump'); void jumpEl.offsetWidth; jumpEl.classList.add('jump');
+  const { x: ox, y: oy } = goalOrigin();
+  const colors = ['#ff8a3d', '#ffd166', '#9b6dd6', '#4fc3f7', '#ffffff'];
+  for (let i = 0; i < 28; i++) {
+    const p = document.createElement('div');
+    p.className = 'confetti';
+    p.style.background = colors[i % colors.length];
+    p.style.left = ox + 'px'; p.style.top = oy + 'px';
+    const a = Math.random() * Math.PI * 2, rad = 50 + Math.random() * 110;
+    p.style.setProperty('--dx', Math.cos(a) * rad + 'px');
+    p.style.setProperty('--dy', Math.sin(a) * rad + 50 + 'px');
+    document.body.appendChild(p);
+    setTimeout(() => p.remove(), 1700);
+  }
+}
+
+/* ---------------- Layouts ---------------- */
+let hobbit, jumpEl, render;
+// where the confetti bursts from (the goal point for each layout)
+let goalOrigin = () => { const r = jumpEl.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; };
+
+if (LAYOUT === 'bar') {
+  hobbit = makeHobbit($('barWalker'), 2);
+  jumpEl = $('barWalker').firstChild;
+  let goalCp;
+  goalOrigin = () => { const r = $('barGoal').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top }; };
+  const track = $('lane').querySelector('.track');
+  const lane = $('lane');
+  for (let m = 0; m <= GOAL_MI; m++) {
+    const t = document.createElement('div');
+    t.className = 'tick'; t.textContent = m;
+    t.style.left = `calc(${m / GOAL_MI} * (100% - 68px))`;
+    lane.appendChild(t);
+  }
+  render = (tot, d, j) => {
+    const cp = nextCheckpoint(j);
+    if (cp !== goalCp || !$('barGoal').firstChild) { goalCp = cp; $('barGoal').replaceChildren(iconFor(cp)); }
+    $('barSteps').textContent = fmt(tot.steps);
+    $('barSpeed').textContent = d.speedMph.toFixed(1) + ' mph' + (d.stepsEstimated ? ' · steps est.' : '');
+    $('barMiles').textContent = tot.miles.toFixed(2);
+    const goalN = Math.floor(tot.miles / GOAL_MI);
+    const frac = celebrating() ? 1 : (tot.miles % GOAL_MI) / GOAL_MI;
+    $('barLap').textContent = (goalN > 0 ? `★x${goalN} · ` : '') + nextText(j).toUpperCase();
+    // snap back to the start (no slide) when a new goal begins
+    const back = frac < parseFloat($('barFill').dataset.f || 0) - 0.5;
+    [$('barFill'), $('barWalker')].forEach(el => el.style.transition = back ? 'none' : '');
+    $('barFill').style.width = frac * 100 + '%'; $('barFill').dataset.f = frac;
+    $('barWalker').style.left = frac * track.clientWidth + 'px';
+  };
+}
+
+if (LAYOUT === 'steps') {
+  hobbit = makeHobbit($('stepsSprite'), 3);
+  jumpEl = $('stepsSprite').firstChild;
+  render = (tot, d, j) => {
+    $('cardSteps').textContent = fmt(tot.steps);
+    $('cardSub').innerHTML = esc(tot.miles.toFixed(2) + ' mi this stream' + (d.stepsEstimated ? ' · est.' : '')) + '<br>' + esc(nextText(j));
+  };
+}
+
+if (LAYOUT === 'border') {
+  hobbit = makeHobbit($('borderJump'), 2);
+  jumpEl = $('borderJump');
+  const svg = $('borderSvg');
+  const INSET = 26; // distance of the path from the screen edge
+  let W, H, perim;
+  const pts = () => [[INSET, INSET], [W - INSET, INSET], [W - INSET, H - INSET], [INSET, H - INSET]];
+  // position along the border: starts top-left, goes clockwise, SIDE_MI per side
+  function pointAt(mi) {
+    const m = ((mi % LOOP_MI) + LOOP_MI) % LOOP_MI;
+    const side = Math.min(3, Math.floor(m / SIDE_MI)), f = (m - side * SIDE_MI) / SIDE_MI;
+    const p = pts(), a = p[side], b = p[(side + 1) % 4];
+    return { x: a[0] + (b[0] - a[0]) * f, y: a[1] + (b[1] - a[1]) * f, side };
+  }
+  function layout() {
+    W = innerWidth; H = innerHeight;
+    const p = pts();
+    const d = `M${p[0]} L${p[1]} L${p[2]} L${p[3]} Z`;
+    perim = 2 * (W - 2 * INSET) + 2 * (H - 2 * INSET);
+    svg.innerHTML = `
+      <path d="${d}" fill="none" stroke="#2e2440" stroke-width="8" stroke-linejoin="round" opacity=".9"/>
+      <path d="${d}" fill="none" stroke="#4a3d60" stroke-width="2" stroke-dasharray="2 10"/>
+      <path id="walked" d="${d}" fill="none" stroke="#ff8a3d" stroke-width="8" stroke-linejoin="round" stroke-dasharray="0 ${perim}"/>`;
+    const c = $('corners'); c.innerHTML = '';
+    const marks = [LOOP_MI, SIDE_MI, SIDE_MI * 2, SIDE_MI * 3];
+    if (GOAL_MI < LOOP_MI && !marks.includes(GOAL_MI)) marks.push(GOAL_MI);
+    marks.forEach(m => {
+      const pt = pointAt(m), el = document.createElement('div');
+      el.className = 'corner' + (m === GOAL_MI ? ' goalmark' : '');
+      el.dataset.mi = m;
+      el.textContent = m === GOAL_MI ? `★ ${m} MI` : (m === LOOP_MI ? 'START' : m + ' MI');
+      el.style.left = pt.x + 'px'; el.style.top = pt.y + 'px';
+      c.appendChild(el);
+    });
+  }
+  layout(); addEventListener('resize', layout);
+  goalOrigin = () => { const pt = pointAt(GOAL_MI); return { x: pt.x, y: pt.y - 30 }; };
+
+  // smooth movement between data updates
+  let shownMi = 0, targetMi = 0;
+  function frame() {
+    shownMi += (targetMi - shownMi) * 0.08;
+    if (Math.abs(targetMi - shownMi) < 0.0005) shownMi = targetMi;
+    const pt = pointAt(shownMi);
+    hobbit.flip = pt.side === 2; // walking right-to-left along the bottom
+    $('borderWalker').style.transform = `translate(${pt.x - hobbit.width / 2}px, ${pt.y - hobbit.height + 6}px)`;
+    const tag = $('borderTag');
+    // tag goes on the inside of the path: below on top edge, left on right edge, etc.
+    let tx, ty;
+    if (pt.side === 1)      { tx = pt.x - hobbit.width / 2 - tag.offsetWidth - 10; ty = pt.y - hobbit.height / 2 - tag.offsetHeight / 2; }
+    else if (pt.side === 3) { tx = pt.x + hobbit.width / 2 + 10;                   ty = pt.y - hobbit.height / 2 - tag.offsetHeight / 2; }
+    else if (pt.side === 0) { tx = pt.x - tag.offsetWidth / 2; ty = pt.y + 14; }
+    else                    { tx = pt.x - tag.offsetWidth / 2; ty = pt.y - hobbit.height - tag.offsetHeight - 8; }
+    tx = Math.min(Math.max(tx, 4), W - tag.offsetWidth - 4);
+    ty = Math.min(Math.max(ty, 4), H - tag.offsetHeight - 4);
+    tag.style.left = tx + 'px'; tag.style.top = ty + 'px';
+    const walked = $('walked');
+    if (walked) {
+      // each side is SIDE_MI miles but sides differ in pixels, so measure along the real path
+      const sideLen = [W - 2 * INSET, H - 2 * INSET, W - 2 * INSET, H - 2 * INSET];
+      const m = ((shownMi % LOOP_MI) + LOOP_MI) % LOOP_MI, side = Math.min(3, Math.floor(m / SIDE_MI));
+      let px = 0; for (let i = 0; i < side; i++) px += sideLen[i];
+      px += (m - side * SIDE_MI) / SIDE_MI * sideLen[side];
+      walked.setAttribute('stroke-dasharray', `${px} ${perim}`);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  const stepsPos = Q.get('steps');
+  if (['bl', 'br', 'tl', 'tr', 'bc'].includes(stepsPos)) $('comboSteps').classList.add('show', stepsPos);
+  render = (tot, d, j) => {
+    $('comboStepsNum').textContent = fmt(tot.steps);
+    $('comboStepsSub').textContent = tot.miles.toFixed(2) + ' mi this stream' + (d.stepsEstimated ? ' · est.' : '');
+    targetMi = tot.miles;
+    if (tot.miles < shownMi - 0.5) shownMi = tot.miles; // after a reset, jump straight back
+    $('borderTag').innerHTML = esc(`${tot.miles.toFixed(2)} mi · ${fmt(tot.steps)} steps`) + '<br><span style="color:var(--gold)">' + esc(nextText(j)) + '</span>';
+    const inLoop = tot.miles % LOOP_MI;
+    document.querySelectorAll('.corner').forEach(el => {
+      const m = +el.dataset.mi;
+      el.classList.toggle('done', m === GOAL_MI ? tot.miles >= GOAL_MI : m === LOOP_MI ? tot.miles >= LOOP_MI : inLoop >= m);
+    });
+  };
+}
+
+/* ---------------- Data feed ---------------- */
+let lastTs = 0, latest = null, reachedSeen = null;
+const root = $(LAYOUT === 'bar' ? 'bar' : LAYOUT === 'border' ? 'border' : 'stepsCard');
+function onData(d) {
+  if (d && d.type === 'reset') { resetTotals(); if (latest) onData({ ...latest, distanceMi: 0, steps: 0 }); return; }
+  if (!d.connected) { root.classList.add('offline'); hobbit.walking = false; return; }
+  latest = d; lastTs = d.ts || Date.now();
+  root.classList.remove('offline');
+  const tot = ingest(d);
+  hobbit.walking = d.speedMph > 0.05 && d.status !== 'Paused' && d.status !== 'Stopped';
+  const j = typeof d.journeyMi === 'number' ? d.journeyMi : tot.miles; // total journey miles (kept by the dashboard)
+  hobbit.setGear(gearAt(j));
+  const n = Math.floor(tot.miles / GOAL_MI);
+  const reached = reachedCount(j);
+  if (reachedSeen === null) reachedSeen = reached;    // no party for checkpoints passed before this window opened
+  let text = null;
+  if (reached > reachedSeen) { text = 'CHECKPOINT REACHED!'; reachedSeen = reached; }
+  if (n > goalsSeen) { goalsSeen = n; text = text || (n > 1 ? `GOAL x${n}! ${+(GOAL_MI * n).toFixed(2)} MI` : `GOAL! ${GOAL_MI} MILES`); }
+  if (text) celebrateUntil = Date.now() + 2400;
+  render(tot, d, j);
+  if (text) celebrate(text);
+}
+setInterval(() => {
+  if (!celebrating()) hobbit.celebrating = false;
+  hobbit.tick();
+  if (lastTs && Date.now() - lastTs > 5000) { root.classList.add('offline'); hobbit.walking = false; }
+}, 280);
+
+// Esc inside stream mode returns to the dashboard
+addEventListener('keydown', e => { if (e.key === 'Escape' && parent !== window) parent.postMessage('pitpat-exit', '*'); });
+
+if (Q.get('demo')) {
+  // Fake data at high speed so you can watch the hobbit move. ?start=6.5 starts near the goal.
+  resetTotals();
+  let mi = parseFloat(Q.get('start')) || 0;
+  let jm = parseFloat(Q.get('journey')) || mi;  // ?journey=130 starts the demo 130 mi into the journey
+  goalsSeen = Math.floor(mi / GOAL_MI);
+  setInterval(() => {
+    mi += 0.02; jm += 0.02;
+    onData({ connected: true, journeyMi: jm, speedMph: 3.0, distanceMi: mi, steps: Math.round(mi * 2000), stepsEstimated: true, status: 'Running', ts: Date.now() });
+  }, 250);
+} else {
+  try { new BroadcastChannel('pitpat-overlay').onmessage = e => onData(e.data); } catch {}
+  // direct messages from the dashboard that opened this window / frame
+  addEventListener('message', e => { if (e.data && e.data.pitpat) onData(e.data.pitpat); });
+}
+</script>
+</body>
+</html>

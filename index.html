@@ -227,9 +227,52 @@
                         <button id="speedUpBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect" disabled>Speed Up</button>
                     </div>
                     <div class="slider-group">
-                        <label class="slider-label" for="speedSlider">Set Speed (kph): <span id="sliderValue">0</span></label>
-                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1" class="mdl-slider mdl-js-slider">
+                        <label class="slider-label" for="speedSlider">Set Speed (mph): <span id="sliderValue">0</span></label>
+                        <input type="range" id="speedSlider" min="0.7" max="3.5" step="0.1" value="1" class="mdl-slider mdl-js-slider">
                     </div>
+                    <div class="controls">
+                        <label class="slider-label" for="streamLayout">Stream overlay:</label>
+                        <select id="streamLayout" style="font-size:1em;padding:4px;">
+                            <option value="bar">Progress bar</option>
+                            <option value="border">Screen border</option>
+                            <option value="border-steps">Screen border + step counter</option>
+                            <option value="steps">Step counter only</option>
+                        </select>
+                        <select id="streamStepsPos" style="font-size:1em;padding:4px;display:none;" title="Where the step counter sits">
+                            <option value="bl">Step counter: bottom left</option>
+                            <option value="br">Step counter: bottom right</option>
+                            <option value="tl">Step counter: top left</option>
+                            <option value="tr">Step counter: top right</option>
+                        </select>
+                        <button id="streamModeBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect">Start Stream Mode</button>
+                        <br>
+                        <label class="slider-label" for="vertLayout">Vertical stream:</label>
+                        <select id="vertLayout" style="font-size:1em;padding:4px;">
+                            <option value="bar">Progress bar (stacked)</option>
+                            <option value="border-steps">Screen border + step counter</option>
+                            <option value="border">Screen border</option>
+                            <option value="steps">Step counter only</option>
+                        </select>
+                        <button id="vertWindowBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect">Open Vertical Window</button>
+                        <button id="resetStreamBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect btn-red">Reset Stream Totals</button>
+                    </div>
+                    <div class="slider-group">
+                        <label class="slider-label" for="journeyInput">Journey total so far (mi, all streams):</label>
+                        <input type="number" id="journeyInput" min="0" step="0.01" style="width:7em;font-size:1em;">
+                    </div>
+                    <div class="slider-group">
+                        <label class="slider-label" for="stepTrackerLinkInput">Step Tracker sync link (from the Discord bot setup; keep it private):</label>
+                        <input type="password" id="stepTrackerLinkInput" placeholder="https://…/donni?key=…" autocomplete="off" style="width:22em;font-size:1em;">
+                    </div>
+                    <div class="slider-group">
+                        <label class="slider-label" for="strideInput">Stride length (ft, used when the pad doesn't report steps):</label>
+                        <input type="number" id="strideInput" min="0.5" max="6" step="0.1" style="width:5em;font-size:1em;">
+                    </div>
+                    <details style="width:100%;max-width:700px;margin-top:1em;font-size:0.8em;">
+                        <summary>Debug: raw treadmill data</summary>
+                        <p id="debugInfo" style="font-family:monospace;">Connect to see data.</p>
+                        <p id="debugHex" style="font-family:monospace;word-break:break-all;"></p>
+                    </details>
                 </div>
             </section>
             <section class="mdl-layout__tab-panel" id="history-panel">
@@ -245,6 +288,7 @@
                                 <tr>
                                     <th>Date</th>
                                     <th>Duration</th>
+                                    <th>Distance</th>
                                     <th>Steps</th>
                                     <th>Calories</th>
                                     <th>Avg Speed</th>

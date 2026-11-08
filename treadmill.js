@@ -5,6 +5,105 @@ const SERVICE_UUID = "0000fba0-0000-1000-8000-00805f9b34fb";
 const NOTIFY_CHAR_UUID = "0000fba2-0000-1000-8000-00805f9b34fb";
 const WRITE_CHAR_UUID = "0000fba1-0000-1000-8000-00805f9b34fb";
 
+// --- Units & step estimation ---
+// The pad always reports metric internally (speed in 1/1000 km/h, distance in metres).
+// We convert to imperial for display only; commands are still sent in kph units.
+const KM_TO_MI = 0.621371;
+const MPH_STEP = 0.1; // speed up/down button increment, in mph
+const MAX_MPH = 3.5;  // top speed allowed from the dashboard (Donni's limit)
+const DEFAULT_STRIDE_FT = 2.64; // adjusted walking stride; adjustable on the dashboard
+const OVERLAY_CHANNEL = 'pitpat-overlay';
+
+function kphUnitsToMph(units) { return (units / 1000) * KM_TO_MI; }
+function mphToKphUnits(mph) { return Math.round((mph / KM_TO_MI) * 1000); }
+function metresToMiles(m) { return (m / 1000) * KM_TO_MI; }
+
+function getStrideFt() {
+    const v = parseFloat(localStorage.getItem('treadmill_stride_ft'));
+    return v > 0 ? v : DEFAULT_STRIDE_FT;
+}
+function setStrideFt(ft) { localStorage.setItem('treadmill_stride_ft', String(ft)); }
+
+// Steps: use the pad's own count when it sends one; many pads report 0 here,
+// so fall back to an estimate from distance and stride length.
+function resolveSteps(rawSteps, distanceMetres) {
+    if (rawSteps > 0 && rawSteps < 1e7) return { steps: rawSteps, estimated: false };
+    const strideMetres = getStrideFt() * 0.3048;
+    return { steps: Math.round(distanceMetres / strideMetres), estimated: true };
+}
+
+// Live feed for the stream overlay (overlay.html in another window of the same browser)
+let overlayChannel = null;
+try { overlayChannel = new BroadcastChannel(OVERLAY_CHANNEL); } catch {}
+// --- Journey total (all streams, in miles) ---
+// Adds only the distance walked while the dashboard is connected, so a pad that
+// still shows an old distance when it connects isn't counted twice.
+const JOURNEY_KEY = 'pitpat_journey_mi';
+let journeyMi = parseFloat(localStorage.getItem(JOURNEY_KEY)) || 0;
+let lastPadMi = null;
+function updateJourney(distanceMi) {
+    if (lastPadMi !== null) {
+        const d = distanceMi >= lastPadMi ? distanceMi - lastPadMi : distanceMi; // pad restarted from 0
+        if (d > 0 && d < 0.5) { journeyMi += d; localStorage.setItem(JOURNEY_KEY, journeyMi.toFixed(4)); }
+    }
+    lastPadMi = distanceMi;
+    const box = document.getElementById('journeyInput');
+    if (box && document.activeElement !== box) box.value = journeyMi.toFixed(2);
+}
+
+// --- Daily steps (for the Step Tracker Discord bot) ---
+// Counted the same way as the journey miles: only steps taken while connected,
+// so pauses, restarts and reconnects never count twice.
+const DAILY_STEPS_KEY = 'pitpat_daily_steps';
+let dailySteps = {};
+try { dailySteps = JSON.parse(localStorage.getItem(DAILY_STEPS_KEY)) || {}; } catch {}
+let lastPadSteps = null;
+function localDay(ts = Date.now()) {
+    const d = new Date(ts);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function updateDailySteps(padSteps) {
+    if (!(padSteps >= 0)) return;
+    if (lastPadSteps !== null) {
+        const d = padSteps >= lastPadSteps ? padSteps - lastPadSteps : padSteps; // pad restarted from 0
+        if (d > 0 && d < 1000) {
+            const day = localDay();
+            dailySteps[day] = (dailySteps[day] || 0) + d;
+            try { localStorage.setItem(DAILY_STEPS_KEY, JSON.stringify(dailySteps)); } catch {}
+        }
+    }
+    lastPadSteps = padSteps;
+}
+
+// --- Step Tracker sync ---
+// Paste the sync link from the Step Tracker setup into the box on this page.
+// Every few minutes (and when the pad stops) it sends Donni's daily steps and
+// journey miles, so the Discord bot can compare everyone to his real numbers.
+const STEP_TRACKER_LINK_KEY = 'pitpat_steptracker_link';
+let lastSync = 0;
+function syncStepTracker(force) {
+    const link = localStorage.getItem(STEP_TRACKER_LINK_KEY);
+    if (!link || (!force && Date.now() - lastSync < 5 * 60e3)) return;
+    lastSync = Date.now();
+    fetch(link, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({ journeyMi: Number(journeyMi.toFixed(2)), days: dailySteps })
+    }).then(r => { if (!r.ok) console.warn('Step Tracker sync failed', r.status); })
+      .catch(e => console.warn('Step Tracker sync failed', e));
+}
+
+// Overlay windows/frames opened from this page also get a direct message,
+// which works even when the files are opened from a folder (file://).
+const overlayTargets = new Set();
+function broadcastOverlay(payload) {
+    if (overlayChannel) overlayChannel.postMessage(payload);
+    overlayTargets.forEach(w => {
+        if (!w || w.closed) { overlayTargets.delete(w); return; }
+        try { w.postMessage({ pitpat: payload }, '*'); } catch {}
+    });
+}
+
 // --- UI Elements ---
 const connectBtn = document.getElementById('connectBtn');
 const statusDiv = document.getElementById('status');
@@ -61,11 +160,12 @@ function renderSessionTable() {
     historyTableBody.innerHTML = '';
     sessions.forEach((s, i) => {
         let avgSpeedDisplay = '-';
-        if (typeof s.avgSpeed === 'number' && !isNaN(s.avgSpeed)) {
-            avgSpeedDisplay = s.avgSpeed.toFixed(2) + ' ' + (s.speedUnit || '');
-        } else if (typeof s.avgSpeed === 'string' && !isNaN(parseFloat(s.avgSpeed))) {
-            avgSpeedDisplay = parseFloat(s.avgSpeed).toFixed(2) + ' ' + (s.speedUnit || '');
+        let avg = parseFloat(s.avgSpeed);
+        if (!isNaN(avg)) {
+            if (s.speedUnit === 'kph') avg *= KM_TO_MI; // older sessions were saved in kph
+            avgSpeedDisplay = avg.toFixed(1) + ' mph';
         }
+        const distDisplay = typeof s.distanceMi === 'number' ? s.distanceMi.toFixed(2) + ' mi' : '-';
         let dateStr = '-';
         if (typeof s.date === 'number' || typeof s.date === 'string') {
             dateStr = dateFns.formatRelative(new Date(s.date), new Date());
@@ -74,7 +174,8 @@ function renderSessionTable() {
         tr.innerHTML = `
             <td>${dateStr}</td>
             <td>${formatDuration(s.duration)}</td>
-            <td>${s.steps}</td>
+            <td>${distDisplay}</td>
+            <td>${Number(s.steps).toLocaleString()}</td>
             <td>${s.calories}</td>
             <td>${avgSpeedDisplay}</td>
             <td><button class="mdl-button mdl-js-button mdl-button--icon" title="Delete" onclick="window.deleteSessionFromTable(${i})"><i class="material-icons">delete</i></button></td>
@@ -268,6 +369,7 @@ function disconnectBluetooth() {
 
 function onDisconnected() {
     connected = false;
+    broadcastOverlay({ connected: false, ts: Date.now() });
     setStatus('Disconnected');
     connectBtn.textContent = "Connect";
     updateRunningState(3);
@@ -325,17 +427,35 @@ function handleNotification(event) {
     else if (running_state_bits === 16) running_state = 2;
     else running_state = 3;
     const statusArr = ["Starting", "Running", "Paused", "Stopped"];
-const speed_unit = "kph";
-const distance_unit = "km";
+    const speed_unit = "mph";
+    const speedMph = kphUnitsToMph(current_speed);
+    const distanceMi = metresToMiles(distance);
+    const stepInfo = resolveSteps(steps, distance);
     treadmillData = {
-        speed: (current_speed / 1000).toFixed(2) + " " + speed_unit,
-        distance: (distance / 1000).toFixed(2) + " " + distance_unit,
+        speed: speedMph.toFixed(1) + " " + speed_unit,
+        distance: distanceMi.toFixed(2) + " mi",
         calories: calories + " kcal",
-        steps: steps,
+        steps: stepInfo.steps.toLocaleString() + (stepInfo.estimated ? " (est.)" : ""),
         duration: Math.round(duration / 1000),
         status: statusArr[running_state] || "Unknown",
-        _raw: { current_speed, distance, calories, steps, duration, speed_unit }
+        _raw: { current_speed, distance, calories, steps, duration, unit_mode }
     };
+    updateDebugPanel(hexStr, { steps, distance, current_speed, unit_mode, estimated: stepInfo.estimated });
+    updateJourney(distanceMi);
+    updateDailySteps(stepInfo.steps);
+    syncStepTracker(false);
+    broadcastOverlay({
+        connected: true,
+        journeyMi,
+        speedMph,
+        distanceMi,
+        steps: stepInfo.steps,
+        stepsEstimated: stepInfo.estimated,
+        calories,
+        durationSec: Math.round(duration / 1000),
+        status: statusArr[running_state] || "Unknown",
+        ts: Date.now()
+    });
     // Log parsed fields
     console.log("Parsed treadmill data:", treadmillData);
     updateDashboard(treadmillData);
@@ -347,7 +467,7 @@ const distance_unit = "km";
         sessionActive = true;
         sessionStartData = {
             date: Date.now(),
-            steps: steps,
+            steps: stepInfo.steps,
             calories: calories,
             distance: distance,
             duration: Math.round(duration / 1000),
@@ -356,29 +476,31 @@ const distance_unit = "km";
             speedUnit: speed_unit
         };
         // Save as first session
-        const avgSpeed = (sessionStartData.speedSum / sessionStartData.speedCount) / 1000;
+        const avgSpeed = kphUnitsToMph(sessionStartData.speedSum / sessionStartData.speedCount);
         upsertLiveSession({
             date: sessionStartData.date,
             duration: sessionStartData.duration,
             steps: sessionStartData.steps,
+            distanceMi: metresToMiles(sessionStartData.distance),
             calories: sessionStartData.calories + ' kcal',
             avgSpeed: avgSpeed,
             speedUnit: sessionStartData.speedUnit || ''
         });
     } else if (running_state === 1 && sessionActive && sessionStartData) {
         // Update session stats
-        sessionStartData.steps = steps;
+        sessionStartData.steps = stepInfo.steps;
         sessionStartData.calories = calories;
         sessionStartData.distance = distance;
         sessionStartData.duration = Math.round(duration / 1000);
         sessionStartData.speedSum += current_speed;
         sessionStartData.speedCount += 1;
         // Update first session in treadmill_sessions
-        const avgSpeed = (sessionStartData.speedSum / sessionStartData.speedCount) / 1000;
+        const avgSpeed = kphUnitsToMph(sessionStartData.speedSum / sessionStartData.speedCount);
         upsertLiveSession({
             date: sessionStartData.date,
             duration: sessionStartData.duration,
             steps: sessionStartData.steps,
+            distanceMi: metresToMiles(sessionStartData.distance),
             calories: sessionStartData.calories + ' kcal',
             avgSpeed: avgSpeed,
             speedUnit: sessionStartData.speedUnit || ''
@@ -509,13 +631,13 @@ stopBtn.addEventListener('click', () => {
 
 speedUpBtn.addEventListener('click', () => {
     if (!connected) return;
-    curTargetSpeed = Math.min(curTargetSpeed + 100, 6000);
+    curTargetSpeed = Math.min(curTargetSpeed + mphToKphUnits(MPH_STEP), mphToKphUnits(MAX_MPH));
     send_data(makePacket("set_speed", curTargetSpeed));
 });
 
 speedDownBtn.addEventListener('click', () => {
     if (!connected) return;
-    curTargetSpeed = Math.max(curTargetSpeed - 1000, 1000);
+    curTargetSpeed = Math.max(curTargetSpeed - mphToKphUnits(MPH_STEP), 1000);
     send_data(makePacket("set_speed", curTargetSpeed));
 });
 
@@ -524,7 +646,7 @@ speedSlider.addEventListener('input', () => {
 });
 speedSlider.addEventListener('change', () => {
     if (!connected) return;
-    curTargetSpeed = Math.round(parseFloat(speedSlider.value) * 1000);
+    curTargetSpeed = Math.min(Math.max(mphToKphUnits(parseFloat(speedSlider.value)), 1000), mphToKphUnits(MAX_MPH));
     send_data(makePacket("set_speed", curTargetSpeed));
 });
 
@@ -560,6 +682,7 @@ function upsertLiveSession(session) {
 function finishSession(reason) {
     sessionActive = false;
     sessionStartData = null;
+    syncStepTracker(true); // send the latest totals as soon as the pad stops or pauses
     // No need to do anything else, as the session is already up-to-date in treadmill_sessions
 }
 
@@ -628,3 +751,162 @@ function showToast(message, timeout = 4000) {
         alert(message); // fallback
     }
 }
+
+// --- Debug panel: shows raw packet bytes so we can locate the real steps field ---
+const debugHex = document.getElementById('debugHex');
+const debugInfo = document.getElementById('debugInfo');
+function updateDebugPanel(hexArr, info) {
+    if (!debugHex) return;
+    debugHex.textContent = hexArr.map((h, i) => `${String(i).padStart(2, ' ')}:${h}`).join('  ');
+    debugInfo.textContent =
+        `steps bytes 14-17 = ${info.steps}  |  distance = ${info.distance} m  |  speed raw = ${info.current_speed}` +
+        `  |  unit flag = ${info.unit_mode}  |  steps shown: ${info.estimated ? 'ESTIMATED from distance' : 'from pad'}`;
+}
+
+// --- Stride length setting ---
+const strideInput = document.getElementById('strideInput');
+if (strideInput) {
+    strideInput.value = getStrideFt();
+    strideInput.addEventListener('change', () => {
+        const v = parseFloat(strideInput.value);
+        if (v > 0.5 && v < 6) { setStrideFt(v); showToast('Stride set to ' + v + ' ft'); }
+        else { strideInput.value = getStrideFt(); }
+    });
+}
+
+// --- Open stream overlay window ---
+// --- Stream Mode ---
+// Shows the overlay full-window, on green, inside THIS page, so the pad
+// connection and the overlay live in one Chrome window for OBS Window Capture.
+// Press Esc (or the small "Exit" button that appears in the top-left corner
+// when you hover there) to get the dashboard back.
+const streamLayout = document.getElementById('streamLayout');
+const streamStepsPos = document.getElementById('streamStepsPos');
+const streamModeBtn = document.getElementById('streamModeBtn');
+try {
+    if (streamLayout && localStorage.getItem('pitpat_stream_layout')) streamLayout.value = localStorage.getItem('pitpat_stream_layout');
+    if (streamStepsPos && localStorage.getItem('pitpat_stream_steps_pos')) streamStepsPos.value = localStorage.getItem('pitpat_stream_steps_pos');
+} catch {}
+function syncStepsPos() { if (streamStepsPos) streamStepsPos.style.display = streamLayout.value === 'border-steps' ? '' : 'none'; }
+if (streamLayout) { streamLayout.addEventListener('change', syncStepsPos); syncStepsPos(); }
+
+// The overlay fills the top of the window; a control strip sits along the bottom
+// so Donni can pause/resume and change speed mid-stream. Crop the strip off in
+// OBS (hold Alt and drag the bottom edge of the Window Capture source).
+const DOCK_H = 76;
+let streamFrame = null, streamDock = null, dockTimer = null;
+function dockBtn(label, onClick, extra = '') {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.style.cssText = 'font:600 15px system-ui,sans-serif;padding:10px 16px;border:0;border-radius:8px;cursor:pointer;' +
+        'background:#3a2f4d;color:#fff;' + extra;
+    b.onclick = onClick;
+    return b;
+}
+function enterStreamMode() {
+    if (streamFrame) return;
+    const v = streamLayout ? streamLayout.value : 'bar';
+    try { localStorage.setItem('pitpat_stream_layout', v); localStorage.setItem('pitpat_stream_steps_pos', streamStepsPos.value); } catch {}
+    const layout = v === 'border-steps' ? 'border' : v;
+    const extra = v === 'border-steps' ? '&steps=' + streamStepsPos.value : '';
+    streamFrame = document.createElement('iframe');
+    streamFrame.src = `overlay.html?layout=${layout}&bg=green${extra}`;
+    streamFrame.style.cssText = `position:fixed;left:0;top:0;width:100vw;height:calc(100vh - ${DOCK_H}px);border:0;z-index:99998;background:#00ff00;`;
+
+    streamDock = document.createElement('div');
+    streamDock.style.cssText = `position:fixed;left:0;right:0;bottom:0;height:${DOCK_H}px;z-index:99999;background:#120d1a;` +
+        'color:#fff;display:flex;align-items:center;gap:10px;padding:0 14px;box-sizing:border-box;font:14px system-ui,sans-serif;' +
+        'border-top:2px solid #9b6dd6;overflow-x:auto;';
+    const pauseB = dockBtn('Pause', () => startBtn.click(), 'min-width:96px;background:#2e7d32;');
+    const downB = dockBtn('− Speed', () => speedDownBtn.click());
+    const speedV = document.createElement('div');
+    speedV.style.cssText = 'font:800 26px system-ui,sans-serif;min-width:110px;text-align:center;font-variant-numeric:tabular-nums;';
+    const upB = dockBtn('+ Speed', () => speedUpBtn.click());
+    const stopB = dockBtn('Stop', () => { if (confirm('Stop the walking pad? (Miles so far are kept for this stream.)')) stopBtn.click(); }, 'background:#8e2b2b;');
+    const stats = document.createElement('div');
+    stats.style.cssText = 'margin-left:8px;line-height:1.5;color:#cfc4df;white-space:nowrap;';
+    const spacer = document.createElement('div'); spacer.style.flex = '1';
+    const connectB = dockBtn('Connect pad', () => connectBtn.click(), 'background:#1565c0;');
+    const exitB = dockBtn('Exit (Esc)', exitStreamMode, 'background:#555;');
+    streamDock.append(pauseB, downB, speedV, upB, stopB, stats, spacer, connectB, exitB);
+    document.body.append(streamFrame, streamDock);
+    overlayTargets.add(streamFrame.contentWindow);
+    document.body.style.overflow = 'hidden';
+
+    // keep the strip in sync with the dashboard
+    const sync = () => {
+        pauseB.textContent = startBtn.textContent === 'Pause' ? 'Pause' : 'Start';
+        pauseB.style.background = pauseB.textContent === 'Pause' ? '#b26a00' : '#2e7d32';
+        [pauseB, downB, upB, stopB].forEach(b => { const src = b === pauseB ? startBtn : b === downB ? speedDownBtn : b === upB ? speedUpBtn : stopBtn;
+            b.disabled = src.disabled; b.style.opacity = src.disabled ? '0.4' : '1'; });
+        speedV.textContent = speedDiv.textContent;
+        const st = !connected ? 'Not connected' : (['Starting', 'Running', 'Paused', 'Stopped'][runningState] || '');
+        stats.innerHTML = `<b>${st}</b> · ${distanceDiv.textContent} · ${stepsDiv.textContent} steps<br>` +
+            `Time ${durationDiv.textContent} · Max ${MAX_MPH} mph`;
+        connectB.style.display = connected ? 'none' : '';
+    };
+    sync(); dockTimer = setInterval(sync, 300);
+}
+function exitStreamMode() {
+    if (!streamFrame) return;
+    clearInterval(dockTimer);
+    overlayTargets.delete(streamFrame.contentWindow);
+    streamFrame.remove(); streamDock.remove(); streamFrame = streamDock = null;
+    document.body.style.overflow = '';
+}
+if (streamModeBtn) streamModeBtn.addEventListener('click', enterStreamMode);
+
+// --- Vertical stream window ---
+// A separate tall window (for 9:16 vertical streams) that sits beside the
+// dashboard. It gets its data from this page, so keep the dashboard open too.
+const vertLayout = document.getElementById('vertLayout');
+const vertWindowBtn = document.getElementById('vertWindowBtn');
+try { if (vertLayout && localStorage.getItem('pitpat_vert_layout')) vertLayout.value = localStorage.getItem('pitpat_vert_layout'); } catch {}
+if (vertWindowBtn) vertWindowBtn.addEventListener('click', () => {
+    const v = vertLayout.value;
+    try { localStorage.setItem('pitpat_vert_layout', v); } catch {}
+    const layout = v === 'border-steps' ? 'border' : v;
+    const extra = v === 'border-steps' ? '&steps=bc' : '';
+    const w = window.open(`overlay.html?layout=${layout}&bg=green&vertical=1${extra}`, 'pitpat_vertical', 'width=540,height=960');
+    if (!w) showToast('Chrome blocked the pop-up: allow pop-ups for this page and try again');
+    else overlayTargets.add(w);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') exitStreamMode(); });
+window.addEventListener('message', e => { if (e.data === 'pitpat-exit') exitStreamMode(); });
+
+// Stream totals (miles/steps across pad stops and starts) live in the overlay;
+// press this at the start of each stream.
+// Journey miles box: shows the running total, and lets you correct it
+// (for example when streaming from a different computer or browser).
+const journeyInput = document.getElementById('journeyInput');
+if (journeyInput) {
+    journeyInput.value = journeyMi.toFixed(2);
+    journeyInput.addEventListener('change', () => {
+        const v = parseFloat(journeyInput.value);
+        if (v >= 0 && v < 100000) { journeyMi = v; localStorage.setItem(JOURNEY_KEY, v.toFixed(4)); showToast('Journey set to ' + v.toFixed(2) + ' mi'); syncStepTracker(true); }
+        else journeyInput.value = journeyMi.toFixed(2);
+    });
+}
+
+// Step Tracker sync link box
+const stepTrackerLinkInput = document.getElementById('stepTrackerLinkInput');
+if (stepTrackerLinkInput) {
+    stepTrackerLinkInput.value = localStorage.getItem(STEP_TRACKER_LINK_KEY) || '';
+    stepTrackerLinkInput.addEventListener('change', () => {
+        const v = stepTrackerLinkInput.value.trim();
+        if (!v) { localStorage.removeItem(STEP_TRACKER_LINK_KEY); showToast('Step Tracker sync off'); return; }
+        if (!/^https:\/\/.+\/donni\?key=.+/.test(v)) { showToast('That doesn\'t look like a Step Tracker sync link'); return; }
+        localStorage.setItem(STEP_TRACKER_LINK_KEY, v);
+        showToast('Step Tracker sync on');
+        syncStepTracker(true);
+    });
+}
+syncStepTracker(true);
+
+const resetStreamBtn = document.getElementById('resetStreamBtn');
+if (resetStreamBtn) resetStreamBtn.addEventListener('click', () => {
+    if (!confirm('Reset this stream\'s miles and steps on the overlay to 0?')) return;
+    broadcastOverlay({ type: 'reset' });
+    try { localStorage.removeItem('pitpat_stream_totals'); } catch {}
+    showToast('Stream totals reset');
+});
