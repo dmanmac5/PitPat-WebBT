@@ -19,12 +19,29 @@ const JOURNEY = {
   //          ...or your own picture, e.g. 'images/bree.png'
   //          (upload the image to an "images" folder in the repo;
   //           about 48×48 pixels looks best)
+  // Matches the Mordor Stops in the "Dmanmac5 – Content Business Plan" sheet
+  // (Master Schedule tab). The Step Tracker Discord bot reads this same list,
+  // so the overlay and the bot always show the same stops.
   checkpoints: [
-    { name: 'The Shire', mile: 14,  icon: 'cottage' },
-    { name: 'Bree',      mile: 135, icon: 'inn' },
-    // add the rest of the checkpoints here, in order, e.g.
-    // { name: 'Next stop', mile: 250, icon: 'tower' },
+    { name: 'Leaving the Shire',            mile: 14,   icon: 'cottage' },
+    { name: 'Bree',                         mile: 135,  icon: 'inn' },
+    { name: 'Weathertop',                   mile: 240,  icon: 'tower' },
+    { name: 'The Stone Trolls',             mile: 393,  icon: 'stones' },
+    { name: 'Rivendell',                    mile: 458,  icon: 'waterfall' },
+    { name: 'Hollin Ridge',                 mile: 690,  icon: 'stones' },
+    { name: 'West-gate of Moria',           mile: 798,  icon: 'cave' },
+    { name: 'Leave Moria / Dimrill Dale',   mile: 840,  icon: 'mountain' },
+    { name: 'Lothlórien',                   mile: 920,  icon: 'forest' },
+    { name: 'Gollum Spotted on the Anduin', mile: 1075, icon: 'marsh' },
+    { name: 'Falls of Rauros',              mile: 1309, icon: 'waterfall' },
+    { name: 'Dead Marshes',                 mile: 1421, icon: 'marsh' },
+    { name: 'Black Gate',                   mile: 1475, icon: 'castle' },
+    { name: 'Henneth Annûn',                mile: 1533, icon: 'waterfall' },
+    { name: "Shelob's Lair",                mile: 1600, icon: 'cave' },
+    { name: 'Isenmouthe',                   mile: 1698, icon: 'castle' },
+    { name: 'Mount Doom',                   mile: 1779, icon: 'volcano' },
   ],
+
 
   // ---- Gear the hobbit picks up --------------------------------------
   // Each item appears on the walking sprite once the journey reaches its mile.
